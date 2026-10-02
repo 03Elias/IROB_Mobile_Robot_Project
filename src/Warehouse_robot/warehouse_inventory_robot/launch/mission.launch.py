@@ -11,8 +11,29 @@ from launch_ros.substitutions import FindPackageShare
 
 
 
+
 def generate_launch_description():
     pkg_share = get_package_share_directory('warehouse_inventory_robot')
+
+    # amcl parameters file location.
+    amcl_params = os.path.join(
+        pkg_share,
+        'config',
+        'amcl.yaml'
+)
+
+    # map file location.
+    map_yaml = os.path.join(
+        pkg_share,
+        'maps',
+        'warehouse.yaml'
+)
+
+    nav2_params = os.path.join(
+        pkg_share,
+        'config',
+        'nav2.yaml'
+)
 
     # Selects the grade this run is configured for; see simulation.launch.py
     # for what it changes in the world and in odometry. Here it decides who
@@ -113,10 +134,52 @@ def generate_launch_description():
 
     # TODO: Navigation Layer
 
+    navigation_launch = IncludeLaunchDescription(
+    PythonLaunchDescriptionSource(
+        os.path.join(
+            get_package_share_directory('nav2_bringup'),
+            'launch',
+            'navigation_launch.py'
+        )
+    ),
+    launch_arguments={
+        'use_sim_time': 'true',
+        'autostart': 'true',
+        'params_file': nav2_params,
+        'use_composition': 'False',
+    }.items(),
+)
+
     # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
     # above, which is exact. Remember to launch amcl only for A grade.
 
+    amcl_node = Node(
+    package='nav2_amcl',
+    executable='amcl',
+    name='amcl',
+    output='screen',
+    parameters=[
+        amcl_params,
+        {'use_sim_time': True},
+    ],
+    condition=IfCondition(grade_is_a),
+)
+
+
+
+
     # TODO: Map server.
+
+    map_server = Node(
+    package='nav2_map_server',
+    executable='map_server',
+    name='map_server',
+    output='screen',
+    parameters=[{
+        'yaml_filename': map_yaml,
+        'use_sim_time': True,
+    }],
+)
     # NOTE: We provide a map at src/Warehouse_robot/warehouse_inventory_robot/maps
 
     # TODO: You might also want to wait for map server and/or amcl to be ready.
@@ -134,6 +197,19 @@ def generate_launch_description():
     #     ros2 lifecycle get /map_server
     #     ros2 lifecycle set /map_server activate
 
+    localization_lifecycle_manager = Node(
+    package='nav2_lifecycle_manager',
+    executable='lifecycle_manager',
+    name='lifecycle_manager_localization',
+    output='screen',
+    parameters=[{
+        'use_sim_time': True,
+        'autostart': True,
+        'node_names': ['map_server', 'amcl'],
+    }],
+    condition=IfCondition(grade_is_a),
+)
+
     return LaunchDescription([
         grade_arg, x_pose_arg, y_pose_arg, headless_arg,
 
@@ -150,6 +226,10 @@ def generate_launch_description():
                 on_exit=[
                     arm_traj_spawner,
                     static_map_to_odom,
+                    map_server,
+                    amcl_node,
+                    localization_lifecycle_manager,
+                    navigation_launch,
                 ],
             )
         ),
