@@ -1,7 +1,7 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition, UnlessCondition
@@ -103,6 +103,13 @@ def generate_launch_description():
         condition=IfCondition(grade_is_a),
     )
 
+    # DetachableJoint reports a StringMsg after each attach/detach command.
+    gripper_state_bridge = Node(
+        package='ros_gz_bridge', executable='parameter_bridge',
+        arguments=['/vacuum_gripper/state@std_msgs/msg/String[gz.msgs.StringMsg'],
+        output='screen',
+    )
+
     # The arm controller's type comes from config/arm_controller_types.yaml,
     # loaded into controller_manager by gz_ros2_control at construction, so it is
     # already defined by the time this spawner runs.
@@ -112,7 +119,10 @@ def generate_launch_description():
         arguments=[
             "lite6_traj_controller", 
             "-c", "/controller_manager",
-            "--param-file", os.path.join(pkg_share, 'config', 'arm_controllers.yaml')
+            "--param-file", os.path.join(pkg_share, 'config', 'arm_controllers.yaml'),
+            "--controller-manager-timeout", "120",
+            "--service-call-timeout", "120",
+            "--switch-timeout", "120",
         ],
         output="screen",
     )
@@ -128,11 +138,32 @@ def generate_launch_description():
                    '--node', 'controller_manager',
                    '--call-service', '/controller_manager/list_controllers',
                    '--service', '/controller_manager/set_parameters',
+                   '--service', '/undock/_action/send_goal',
                    '--topic', '/scan',
+                   '--topic', '/odom',
                    '--timeout', '300'],
     )
 
-    # TODO: Navigation Layer
+    # The simulation starts this spawner before Gazebo has finished creating
+    # controller_manager. On a slow machine its 30-second deadline can expire.
+    wait_for_joint_states = Node(
+        package='warehouse_inventory_robot', executable='wait_for_ready',
+        name='wait_for_joint_states', output='screen',
+        arguments=['--label', 'joint states', '--topic', '/joint_states',
+                   '--timeout', '15'],
+    )
+    joint_state_recovery = Node(
+        package='controller_manager', executable='spawner', output='screen',
+        arguments=['joint_state_broadcaster', '-c', '/controller_manager',
+                   '--controller-manager-timeout', '120',
+                   '--service-call-timeout', '120', '--switch-timeout', '120'],
+    )
+    wait_for_recovered_joint_states = Node(
+        package='warehouse_inventory_robot', executable='wait_for_ready',
+        name='wait_for_recovered_joint_states', output='screen',
+        arguments=['--label', 'recovered joint states',
+                   '--topic', '/joint_states', '--timeout', '180'],
+    )
 
     navigation_launch = IncludeLaunchDescription(
     PythonLaunchDescriptionSource(
@@ -150,9 +181,6 @@ def generate_launch_description():
     }.items(),
 )
 
-    # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
-    # above, which is exact. Remember to launch amcl only for A grade.
-
     amcl_node = Node(
     package='nav2_amcl',
     executable='amcl',
@@ -168,8 +196,6 @@ def generate_launch_description():
 
 
 
-    # TODO: Map server.
-
     map_server = Node(
     package='nav2_map_server',
     executable='map_server',
@@ -182,20 +208,14 @@ def generate_launch_description():
 )
     # NOTE: We provide a map at src/Warehouse_robot/warehouse_inventory_robot/maps
 
-    # TODO: You might also want to wait for map server and/or amcl to be ready.
-    #
-    # A fixed delay is fine for ordering things. It cannot fix one failure you
-    # may hit if you use nav2_lifecycle_manager, though, so it is worth knowing
-    # about in advance: it gives its lifecycle service calls a hardcoded
-    # deadline, and on a cold start (Gazebo still loading meshes) map_server's
-    # reply can miss it. The manager then never sends ACTIVATE and map_server
-    # stays `inactive` indefinitely -- no /map, an empty RViz, and the costmaps
-    # complaining "Can't update static costmap layer". Waiting longer does not
-    # help once the manager has given up, so if you see that, check the state
-    # and finish the transition yourself:
-    #
-    #     ros2 lifecycle get /map_server
-    #     ros2 lifecycle set /map_server activate
+    map_lifecycle_manager = Node(
+        package='nav2_lifecycle_manager', executable='lifecycle_manager',
+        name='lifecycle_manager_map', output='screen',
+        parameters=[{'use_sim_time': True, 'autostart': True,
+                     'bond_timeout': 30.0,
+                     'node_names': ['map_server']}],
+        condition=UnlessCondition(grade_is_a),
+    )
 
     localization_lifecycle_manager = Node(
     package='nav2_lifecycle_manager',
@@ -205,10 +225,23 @@ def generate_launch_description():
     parameters=[{
         'use_sim_time': True,
         'autostart': True,
+        'bond_timeout': 30.0,
         'node_names': ['map_server', 'amcl'],
     }],
     condition=IfCondition(grade_is_a),
 )
+
+    wait_for_map = Node(
+        package='warehouse_inventory_robot', executable='wait_for_ready',
+        name='wait_for_map', output='screen',
+        arguments=['--label', 'map', '--topic', '/map', '--timeout', '300'],
+    )
+
+    start_localization = [
+        arm_traj_spawner, static_map_to_odom, map_server,
+        map_lifecycle_manager, amcl_node, localization_lifecycle_manager,
+        wait_for_map,
+    ]
 
     return LaunchDescription([
         grade_arg, x_pose_arg, y_pose_arg, headless_arg,
@@ -216,6 +249,7 @@ def generate_launch_description():
         simulation_launch,
 
         relocate_robot,
+        gripper_state_bridge,
 
         # Start watching for the simulation to come up.
         wait_for_sim,
@@ -223,14 +257,40 @@ def generate_launch_description():
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=wait_for_sim,
-                on_exit=[
-                    arm_traj_spawner,
-                    static_map_to_odom,
-                    map_server,
-                    amcl_node,
-                    localization_lifecycle_manager,
-                    navigation_launch,
-                ],
+                on_exit=lambda event, context: [wait_for_joint_states]
+                if event.returncode == 0 else [
+                    LogInfo(msg='Simulation readiness failed; navigation was not started')],
+            )
+        ),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=wait_for_joint_states,
+                on_exit=lambda event, context: start_localization
+                if event.returncode == 0 else [joint_state_recovery],
+            )
+        ),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=joint_state_recovery,
+                on_exit=lambda event, context: [wait_for_recovered_joint_states]
+                if event.returncode == 0 else [
+                    LogInfo(msg='Joint state broadcaster recovery failed')],
+            )
+        ),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=wait_for_recovered_joint_states,
+                on_exit=lambda event, context: start_localization
+                if event.returncode == 0 else [
+                    LogInfo(msg='Joint states remain unavailable; navigation was not started')],
+            )
+        ),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=wait_for_map,
+                on_exit=lambda event, context: [navigation_launch]
+                if event.returncode == 0 else [
+                    LogInfo(msg='Map readiness failed; navigation was not started')],
             )
         ),
     ])
