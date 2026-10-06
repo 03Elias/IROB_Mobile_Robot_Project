@@ -7,18 +7,20 @@ import rclpy
 import time
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 
 import yaml
 import math
 from pathlib import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 from geometry_msgs.msg import Twist, TwistStamped
 from ament_index_python.packages import get_package_share_directory
 from irobot_create_msgs.action import Undock
 from irobot_create_msgs.msg import DockStatus
 from std_msgs.msg import Empty
+from std_srvs.srv import Empty as EmptyService
+from nav_msgs.msg import OccupancyGrid
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -155,9 +157,77 @@ class MissionNode(Node):
         # TODO: Define other necessary subscribers, publishers, and action clients (e.g., for navigation with Nav2).
 
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        if self.grade == 'a':
+            self._global_localization = self.create_client(
+                EmptyService, '/reinitialize_global_localization')
+            self._turn_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+            self._map_received = False
+            self._amcl_pose = None
+            map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(
+                OccupancyGrid, '/map', lambda msg: setattr(self, '_map_received', True), map_qos)
+            self.create_subscription(
+                PoseWithCovarianceStamped, '/amcl_pose',
+                lambda msg: setattr(self, '_amcl_pose', msg), qos_profile_sensor_data)
 
     def _dock_status_callback(self, msg):
         self.is_docked = msg.is_docked
+
+    def localize_globally(self):
+        """Find the grade A start pose without using the examiner's clicked point."""
+        deadline = time.monotonic() + 30.0
+        while not self._map_received and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if not self._map_received or not self._global_localization.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error('AMCL map or global localization service is unavailable')
+            return False
+
+        self._amcl_pose = None
+        future = self._global_localization.call_async(EmptyService.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        if not future.done() or future.result() is None:
+            self.get_logger().error('AMCL global localization request failed')
+            return False
+
+        self.get_logger().info('AMCL searching the map; rotating to collect laser scans')
+        start = self.get_clock().now()
+        # Complete a full turn before trusting a pose; repeated aisles can look alike.
+        turn_duration = 2.0 * math.pi / 0.4
+        wall_deadline = time.monotonic() + 90.0
+        stable_updates = 0
+        last_stamp = None
+        try:
+            while time.monotonic() < wall_deadline and \
+                    (self.get_clock().now() - start).nanoseconds * 1e-9 < 2 * turn_duration:
+                elapsed = (self.get_clock().now() - start).nanoseconds * 1e-9
+                cmd = TwistStamped()
+                cmd.header.stamp = self.get_clock().now().to_msg()
+                cmd.header.frame_id = 'base_link'
+                cmd.twist.angular.z = 0.4
+                self._turn_pub.publish(cmd)
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+                pose = self._amcl_pose
+                if pose is None or pose.header.stamp == last_stamp:
+                    continue
+                last_stamp = pose.header.stamp
+                covariance = pose.pose.covariance
+                if elapsed >= turn_duration and covariance[0] < 0.25 and \
+                        covariance[7] < 0.25 and covariance[35] < 0.12:
+                    stable_updates += 1
+                    if stable_updates >= 5:
+                        self.get_logger().info('AMCL pose converged')
+                        return True
+                else:
+                    stable_updates = 0
+        finally:
+            stop = TwistStamped()
+            stop.header.stamp = self.get_clock().now().to_msg()
+            stop.header.frame_id = 'base_link'
+            self._turn_pub.publish(stop)
+
+        self.get_logger().error('AMCL did not converge within the search window')
+        return False
 
     def undock_robot(self):
         # TODO: Implement undocking logic using the Undock action client (self._undock_client).
@@ -300,6 +370,10 @@ class MissionNode(Node):
 
             elif state == 'UNDOCK':
                 done = self.undock_robot()
+                next_state = 'LOCALIZE' if self.grade == 'a' else 'GO_TO_PICK'
+
+            elif state == 'LOCALIZE':
+                done = self.localize_globally()
                 next_state = 'GO_TO_PICK'
             
             elif state == 'GO_TO_PICK':

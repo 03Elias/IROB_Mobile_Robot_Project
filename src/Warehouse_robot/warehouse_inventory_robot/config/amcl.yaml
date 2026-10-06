@@ -23,7 +23,7 @@ amcl:
     alpha5: 0.2
 
     min_particles: 500
-    max_particles: 2000
+    max_particles: 10000
 
     pf_err: 0.05
     pf_z: 0.99
@@ -53,11 +53,6 @@ amcl:
     recovery_alpha_slow: 0.001
     recovery_alpha_fast: 0.1
 
-    set_initial_pose: true
-    initial_pose:
-      x: 0.0
-      y: 0.0
-      z: 0.0
-      yaw: 0.0
+    set_initial_pose: false
     always_reset_initial_pose: false
     first_map_only: false
