@@ -1,4 +1,3 @@
-
 #which path should we take?
 planner_server:
   ros__parameters:
@@ -17,6 +16,7 @@ planner_server:
 controller_server:
   ros__parameters:
     use_sim_time: true
+    enable_stamped_cmd_vel: true
 
     controller_frequency: 10.0
     odom_topic: "/odom"
@@ -80,7 +80,7 @@ controller_server:
           "GoalAlign",
           "PathAlign",
           "PathDist",
-          "GoalDist"
+          "GoalDist",
         ]
 
       BaseObstacle.scale: 0.02
@@ -94,7 +94,6 @@ controller_server:
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
 
-
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -107,17 +106,13 @@ local_costmap:
       robot_base_frame: base_link
 
       rolling_window: true
-      width: 3.0
-      height: 3.0
+      width: 3
+      height: 3
       resolution: 0.05
 
       robot_radius: 0.22
 
-      plugins:
-        [
-          "obstacle_layer",
-          "inflation_layer"
-        ]
+      plugins: ["obstacle_layer", "inflation_layer"]
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -143,7 +138,6 @@ local_costmap:
 
       always_send_full_costmap: true
 
-
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -159,12 +153,7 @@ global_costmap:
       robot_radius: 0.22
       track_unknown_space: true
 
-      plugins:
-        [
-          "static_layer",
-          "obstacle_layer",
-          "inflation_layer"
-        ]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -206,10 +195,10 @@ bt_navigator:
     bt_loop_duration: 10
     default_server_timeout: 20
 
-
 behavior_server:
   ros__parameters:
     use_sim_time: true
+    enable_stamped_cmd_vel: true
 
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
@@ -219,12 +208,7 @@ behavior_server:
 
     cycle_frequency: 10.0
 
-    behavior_plugins:
-      [
-        "spin",
-        "backup",
-        "wait"
-      ]
+    behavior_plugins: ["spin", "backup", "wait"]
 
     spin:
       plugin: "nav2_behaviors::Spin"
@@ -240,3 +224,88 @@ behavior_server:
     robot_base_frame: base_link
 
     transform_tolerance: 0.3
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: true
+    enable_stamped_cmd_vel: true
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.25, 0.0, 1.0]
+    min_velocity: [-0.25, 0.0, -1.0]
+    max_accel: [2.5, 0.0, 3.2]
+    max_decel: [-2.5, 0.0, -3.2]
+    odom_topic: "/odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+collision_monitor:
+  ros__parameters:
+    enable_stamped_cmd_vel: true
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "local_costmap/published_footprint"
+      time_before_collision: 1.2
+      simulation_time_step: 0.1
+      min_points: 6
+      visualize: false
+      enabled: true
+
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "scan"
+      min_height: 0.15
+      max_height: 2.0
+      enabled: true
+
+docking_server:
+  ros__parameters:
+    enable_stamped_cmd_vel: true
+    controller_frequency: 50.0
+    initial_perception_timeout: 5.0
+    wait_charge_timeout: 5.0
+    dock_approach_timeout: 30.0
+    undock_linear_tolerance: 0.05
+    undock_angular_tolerance: 0.1
+    max_retries: 3
+    base_frame: "base_link"
+    fixed_frame: "odom"
+    dock_backwards: false
+    dock_prestaging_tolerance: 0.5
+
+    dock_plugins: ["simple_charging_dock"]
+    simple_charging_dock:
+      plugin: "opennav_docking::SimpleChargingDock"
+      docking_threshold: 0.05
+      staging_x_offset: -0.7
+      use_external_detection_pose: true
+      use_battery_status: false
+      use_stall_detection: false
+      external_detection_timeout: 1.0
+      external_detection_translation_x: -0.18
+      external_detection_translation_y: 0.0
+      external_detection_rotation_roll: -1.57
+      external_detection_rotation_pitch: -1.57
+      external_detection_rotation_yaw: 0.0
+      filter_coef: 0.1
+
+    controller:
+      k_phi: 3.0
+      k_delta: 2.0
+      v_linear_min: 0.15
+      v_linear_max: 0.15

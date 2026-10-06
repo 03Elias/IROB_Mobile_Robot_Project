@@ -11,13 +11,12 @@ from rclpy.action import ActionClient
 import yaml
 import math
 from pathlib import Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped
 
 from geometry_msgs.msg import Twist, TwistStamped
 from ament_index_python.packages import get_package_share_directory
 from irobot_create_msgs.action import Undock
 from std_msgs.msg import Empty
-from std_srvs.srv import Empty as EmptyService
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -146,63 +145,13 @@ class MissionNode(Node):
         # TODO: Define other necessary subscribers, publishers, and action clients (e.g., for navigation with Nav2).
 
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-        self._global_localization_client = self.create_client(
-            EmptyService,
-            '/reinitialize_global_localization'
-        )
-        self._cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
-        self._amcl_pose_received = False
-        self._amcl_pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped,
-            '/amcl_pose',
-            self._amcl_pose_callback,
-            10
-        )
-
-    def _amcl_pose_callback(self, _msg):
-        self._amcl_pose_received = True
-
-    def global_localize(self):
-        """Spread AMCL particles globally and rotate to collect laser scans."""
-        if not self._global_localization_client.wait_for_service(timeout_sec=30.0):
-            self.get_logger().error('AMCL global-localization service is unavailable.')
-            return False
-
-        self._amcl_pose_received = False
-        request_future = self._global_localization_client.call_async(
-            EmptyService.Request()
-        )
-        rclpy.spin_until_future_complete(self, request_future, timeout_sec=10.0)
-        if not request_future.done() or request_future.result() is None:
-            self.get_logger().error('AMCL global-localization request failed.')
-            return False
-
-        self.get_logger().info('Rotating to let AMCL observe the surroundings...')
-        rotate_until = time.monotonic() + 18.0
-        command = TwistStamped()
-        command.header.frame_id = 'base_link'
-        command.twist.angular.z = 0.4
-
-        while time.monotonic() < rotate_until:
-            command.header.stamp = self.get_clock().now().to_msg()
-            self._cmd_vel_pub.publish(command)
-            rclpy.spin_once(self, timeout_sec=0.1)
-
-        stop = TwistStamped()
-        stop.header.stamp = self.get_clock().now().to_msg()
-        stop.header.frame_id = 'base_link'
-        self._cmd_vel_pub.publish(stop)
-
-        if not self._amcl_pose_received:
-            self.get_logger().error('AMCL did not produce a pose while scanning.')
-            return False
-
-        self.get_logger().info('AMCL produced a pose; localization is ready.')
-        return True
 
     def undock_robot(self):
         # TODO: Implement undocking logic using the Undock action client (self._undock_client).
         #       Return True once the base is undocked, False if it refused.
+
+        if not self._undock_client.wait_for_server(timeout_sec=10.0):
+            return False
 
         goal_future = self._undock_client.send_goal_async(Undock.Goal())
         rclpy.spin_until_future_complete(self,goal_future)
@@ -323,12 +272,10 @@ class MissionNode(Node):
         max_attempts = 10
 
         while state not in ('DONE', 'FAILED'):
+            self.get_logger().info(f'{state} state running')
+
             if state == 'UNDOCK':
                 done = self.undock_robot()
-                next_state = 'LOCALIZE' if self.grade == 'a' else 'GO_TO_PICK'
-
-            elif state == 'LOCALIZE':
-                done = self.global_localize()
                 next_state = 'GO_TO_PICK'
             
             elif state == 'GO_TO_PICK':
