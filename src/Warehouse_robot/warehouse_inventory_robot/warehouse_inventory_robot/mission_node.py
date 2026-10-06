@@ -7,6 +7,7 @@ import rclpy
 import time
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import qos_profile_sensor_data
 
 import yaml
 import math
@@ -16,6 +17,7 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist, TwistStamped
 from ament_index_python.packages import get_package_share_directory
 from irobot_create_msgs.action import Undock
+from irobot_create_msgs.msg import DockStatus
 from std_msgs.msg import Empty
 
 from control_msgs.action import FollowJointTrajectory
@@ -52,6 +54,10 @@ DROP_BOX_BY_GRADE = {
     'c': 'shelf_7_ID20',   # target-2, across the warehouse
     'a': 'shelf_7_ID20',   # target-2, same as C
 }
+
+SAFE_JOINTS = [0.0, 0.87, 1.57, 0.0, -1.57, 0.0]
+PICK_JOINTS = [0.0, 1.50, 1.68, 0.0, 0.26, 0.0]
+PLACE_JOINTS = [0.0, 1.50, 2.13, 0.0, 0.53, 0.0]
 
 
 def load_shelf(name: str) -> PoseStamped:
@@ -135,6 +141,10 @@ class MissionNode(Node):
 
         self._attach_pub = self.create_publisher(Empty, '/vacuum_gripper/attach', 10)
         self._detach_pub = self.create_publisher(Empty, '/vacuum_gripper/detach', 10)
+        self.is_docked = None
+        self.create_subscription(
+            DockStatus, '/dock_status', self._dock_status_callback,
+            qos_profile_sensor_data)
         self._undock_client = ActionClient(self, Undock, '/undock')
         self._arm_client = ActionClient(
             self, 
@@ -146,9 +156,16 @@ class MissionNode(Node):
 
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
 
+    def _dock_status_callback(self, msg):
+        self.is_docked = msg.is_docked
+
     def undock_robot(self):
         # TODO: Implement undocking logic using the Undock action client (self._undock_client).
         #       Return True once the base is undocked, False if it refused.
+
+        rclpy.spin_once(self, timeout_sec=1.0)
+        if self.is_docked is False:
+            return True
 
         if not self._undock_client.wait_for_server(timeout_sec=10.0):
             return False
@@ -158,13 +175,15 @@ class MissionNode(Node):
         goal_handle = goal_future.result()
 
         if not goal_handle.accepted:
-            return False
+            rclpy.spin_once(self, timeout_sec=0.5)
+            return self.is_docked is False
 
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
         result = result_future.result()
 
         if (result.status == GoalStatus.STATUS_SUCCEEDED):
+            self.is_docked = False
             return True
         else:
             return False
@@ -241,7 +260,8 @@ class MissionNode(Node):
         if not result_future.done():
             self.get_logger().error('Arm trajectory did not finish in time!')
             return False
-        return True
+        result = result_future.result()
+        return result is not None and result.status == GoalStatus.STATUS_SUCCEEDED
 
 
     # =========================================================================
@@ -267,33 +287,53 @@ class MissionNode(Node):
 
         # TODO: Implement the mission logic (either State Machine or Behavior Tree).
 
-        state = 'UNDOCK'
+        state = 'ARM_SAFE'
         attempts = 0
         max_attempts = 10
 
         while state not in ('DONE', 'FAILED'):
             self.get_logger().info(f'{state} state running')
 
-            if state == 'UNDOCK':
+            if state == 'ARM_SAFE':
+                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
+                next_state = 'UNDOCK'
+
+            elif state == 'UNDOCK':
                 done = self.undock_robot()
                 next_state = 'GO_TO_PICK'
             
             elif state == 'GO_TO_PICK':
                 done = self.go_to_pose(pick_pose)
+                next_state = 'ARM_TO_PICK'
+
+            elif state == 'ARM_TO_PICK':
+                done = self.move_arm_to_joint_angles(PICK_JOINTS)
                 next_state = 'PICK'
 
             elif state == 'PICK':
                 self.toggle_vacuum(True)
                 done = True
+                next_state = 'ARM_SAFE_AFTER_PICK'
+
+            elif state == 'ARM_SAFE_AFTER_PICK':
+                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
                 next_state = 'GO_TO_DROP'
 
             elif state == 'GO_TO_DROP':
                 done = self.go_to_pose(drop_pose)
+                next_state = 'ARM_TO_PLACE'
+
+            elif state == 'ARM_TO_PLACE':
+                done = self.move_arm_to_joint_angles(PLACE_JOINTS)
                 next_state = 'DROP'
             
             elif state == 'DROP':
                 self.toggle_vacuum(False)
                 done = True
+                next_state = 'ARM_SAFE_AFTER_DROP'
+
+            elif state == 'ARM_SAFE_AFTER_DROP':
+                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
                 next_state = 'GO_TO_BASE'
                 
             elif state == 'GO_TO_BASE':

@@ -129,6 +129,7 @@ def generate_launch_description():
                    '--call-service', '/controller_manager/list_controllers',
                    '--service', '/controller_manager/set_parameters',
                    '--topic', '/scan',
+                   '--topic', '/odom',
                    '--timeout', '300'],
     )
 

@@ -53,6 +53,11 @@ amcl:
     recovery_alpha_slow: 0.001
     recovery_alpha_fast: 0.1
 
-    set_initial_pose: false
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
     always_reset_initial_pose: false
     first_map_only: false
