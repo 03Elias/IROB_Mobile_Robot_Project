@@ -198,6 +198,18 @@ def generate_launch_description():
     #     ros2 lifecycle get /map_server
     #     ros2 lifecycle set /map_server activate
 
+    map_lifecycle_manager = Node(
+    package='nav2_lifecycle_manager',
+    executable='lifecycle_manager',
+    name='lifecycle_manager_map',
+    output='screen',
+    parameters=[{
+        'use_sim_time': True,
+        'autostart': True,
+        'node_names': ['map_server'],
+    }],
+)
+
     localization_lifecycle_manager = Node(
     package='nav2_lifecycle_manager',
     executable='lifecycle_manager',
@@ -206,7 +218,7 @@ def generate_launch_description():
     parameters=[{
         'use_sim_time': True,
         'autostart': True,
-        'node_names': ['map_server', 'amcl'],
+        'node_names': ['amcl'],
     }],
     condition=IfCondition(grade_is_a),
 )
@@ -228,6 +240,7 @@ def generate_launch_description():
                     arm_traj_spawner,
                     static_map_to_odom,
                     map_server,
+                    map_lifecycle_manager,
                     amcl_node,
                     localization_lifecycle_manager,
                     navigation_launch,

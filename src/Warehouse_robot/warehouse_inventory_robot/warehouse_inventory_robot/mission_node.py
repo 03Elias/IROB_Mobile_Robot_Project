@@ -7,28 +7,34 @@ import rclpy
 import time
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 
 import yaml
 import math
 from pathlib import Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped
 
 from geometry_msgs.msg import Twist, TwistStamped
 from ament_index_python.packages import get_package_share_directory
 from irobot_create_msgs.action import Undock
-from irobot_create_msgs.msg import DockStatus
 from std_msgs.msg import Empty
-from std_srvs.srv import Empty as EmptyService
-from nav_msgs.msg import OccupancyGrid
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
-# TODO: Add any other necessary imports (e.g., for Nav2 actions, or behavior tree libraries).
-
+#build and run the mission behaviour tree
+import py_trees
+#set communication rules for sensor subscriptions
+from rclpy.qos import qos_profile_sensor_data
+#receive AMCL poses and covariance
+from geometry_msgs.msg import PoseWithCovarianceStamped
+#receive the robot's docking status
+from irobot_create_msgs.msg import DockStatus
+#call the global-localization service
+from std_srvs.srv import Empty as EmptyService
+#check the final status of ROS actions
 from action_msgs.msg import GoalStatus
+#send navigation goals to Nav2
 from nav2_msgs.action import NavigateToPose
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,9 +63,37 @@ DROP_BOX_BY_GRADE = {
     'a': 'shelf_7_ID20',   # target-2, same as C
 }
 
+# Added
 SAFE_JOINTS = [0.0, 0.87, 1.57, 0.0, -1.57, 0.0]
 PICK_JOINTS = [0.0, 1.50, 1.68, 0.0, 0.26, 0.0]
 PLACE_JOINTS = [0.0, 1.50, 2.13, 0.0, 0.53, 0.0]
+
+# Added
+class MissionCondition(py_trees.behaviour.Behaviour):
+
+    def __init__(self, name, condition):
+        super().__init__(name)
+        self.condition = condition
+
+    def update(self):
+        if self.condition():
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.FAILURE
+
+
+# Added
+class MissionAction(py_trees.behaviour.Behaviour):
+
+    def __init__(self, name, action, logger):
+        super().__init__(name)
+        self.action = action
+        self.ros_logger = logger
+
+    def update(self):
+        self.ros_logger.info(f'{self.name} behaviour running')
+        if self.action():
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.FAILURE
 
 
 def load_shelf(name: str) -> PoseStamped:
@@ -143,10 +177,6 @@ class MissionNode(Node):
 
         self._attach_pub = self.create_publisher(Empty, '/vacuum_gripper/attach', 10)
         self._detach_pub = self.create_publisher(Empty, '/vacuum_gripper/detach', 10)
-        self.is_docked = None
-        self.create_subscription(
-            DockStatus, '/dock_status', self._dock_status_callback,
-            qos_profile_sensor_data)
         self._undock_client = ActionClient(self, Undock, '/undock')
         self._arm_client = ActionClient(
             self, 
@@ -154,104 +184,107 @@ class MissionNode(Node):
             '/lite6_traj_controller/follow_joint_trajectory'
         )
 
-        # TODO: Define other necessary subscribers, publishers, and action clients (e.g., for navigation with Nav2).
+        #get the dock messages
+        self.is_docked = None
+        self.create_subscription(
+            DockStatus, '/dock_status', self._dock_status_callback,
+            qos_profile_sensor_data)
 
+        #get the pose messages
+        self._amcl_pose = None
+        self.create_subscription(
+            PoseWithCovarianceStamped, '/amcl_pose',
+            self._amcl_pose_callback,
+            qos_profile_sensor_data)
+
+        #create a nav2 action cleint
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-        if self.grade == 'a':
-            self._global_localization = self.create_client(
-                EmptyService, '/reinitialize_global_localization')
-            self._turn_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
-            self._map_received = False
-            self._amcl_pose = None
-            map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-            self.create_subscription(
-                OccupancyGrid, '/map', lambda msg: setattr(self, '_map_received', True), map_qos)
-            self.create_subscription(
-                PoseWithCovarianceStamped, '/amcl_pose',
-                lambda msg: setattr(self, '_amcl_pose', msg), qos_profile_sensor_data)
+        #create service that distributes the particle for the amcl
+        self._localization = self.create_client(EmptyService, '/reinitialize_global_localization')
+        #create a publishes for robot to be able to turn when scanning
+        self._turn_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
 
+    #when dock_status publishes a message the callback is called
+    #and the newest value of dock_status is stored
     def _dock_status_callback(self, msg):
         self.is_docked = msg.is_docked
 
-    def localize_globally(self):
-        """Find the grade A start pose without using the examiner's clicked point."""
-        deadline = time.monotonic() + 30.0
-        while not self._map_received and time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        if not self._map_received or not self._global_localization.wait_for_service(timeout_sec=10.0):
-            self.get_logger().error('AMCL map or global localization service is unavailable')
+    #when amcl_pose publishes a message the callback is called
+    #and the newest value of amcl_pose is stored
+    def _amcl_pose_callback(self, msg):
+        self._amcl_pose = msg
+
+    def localize(self):
+        if not self._localization.wait_for_service(timeout_sec=10.0):
             return False
 
         self._amcl_pose = None
-        future = self._global_localization.call_async(EmptyService.Request())
+        future = self._localization.call_async(EmptyService.Request())
         rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
         if not future.done() or future.result() is None:
-            self.get_logger().error('AMCL global localization request failed')
             return False
 
-        self.get_logger().info('AMCL searching the map; rotating to collect laser scans')
-        start = self.get_clock().now()
-        # Complete a full turn before trusting a pose; repeated aisles can look alike.
-        turn_duration = 2.0 * math.pi / 0.4
-        wall_deadline = time.monotonic() + 90.0
-        stable_updates = 0
+        self.get_logger().info('AMCL searching for its position')
+        cmd = TwistStamped()
         last_stamp = None
         try:
-            while time.monotonic() < wall_deadline and \
-                    (self.get_clock().now() - start).nanoseconds * 1e-9 < 2 * turn_duration:
-                elapsed = (self.get_clock().now() - start).nanoseconds * 1e-9
-                cmd = TwistStamped()
+            while True:
                 cmd.header.stamp = self.get_clock().now().to_msg()
-                cmd.header.frame_id = 'base_link'
+
+                #we make and publish command to rotate 0.4 rad/s
                 cmd.twist.angular.z = 0.4
                 self._turn_pub.publish(cmd)
+
+                #we process messages for 0.1 sec so that _amcl_pose updates
                 rclpy.spin_once(self, timeout_sec=0.1)
-
                 pose = self._amcl_pose
-                if pose is None or pose.header.stamp == last_stamp:
-                    continue
-                last_stamp = pose.header.stamp
-                covariance = pose.pose.covariance
-                if elapsed >= turn_duration and covariance[0] < 0.25 and \
-                        covariance[7] < 0.25 and covariance[35] < 0.12:
-                    stable_updates += 1
-                    if stable_updates >= 5:
-                        self.get_logger().info('AMCL pose converged')
-                        return True
-                else:
-                    stable_updates = 0
-        finally:
-            stop = TwistStamped()
-            stop.header.stamp = self.get_clock().now().to_msg()
-            stop.header.frame_id = 'base_link'
-            self._turn_pub.publish(stop)
 
-        self.get_logger().error('AMCL did not converge within the search window')
-        return False
+                if pose is not None and pose.header.stamp != last_stamp:
+                    last_stamp = pose.header.stamp
+                    #get the covarience 6x6 matrix which represent uncertainties
+                    covariance = pose.pose.covariance
+                    #this number was figured out by logging all the convariances and
+                    #looking for which was the lowest one reached
+                    #covarience[0], [7], and [35] are x, y, and yaw
+                    if (covariance[0] < 20.0 and covariance[7] < 20.0
+                            and covariance[35] < 0.5):
+                        break
+
+            self.get_logger().info('AMCL position found')
+            return True
+        finally:
+            #stop rotating the robot, including when localization is interrupted
+            cmd.header.stamp = self.get_clock().now().to_msg()
+            cmd.twist.angular.z = 0.0
+            self._turn_pub.publish(cmd)
 
     def undock_robot(self):
-        # TODO: Implement undocking logic using the Undock action client (self._undock_client).
-        #       Return True once the base is undocked, False if it refused.
-
+        #we give the docking status callback time to update
         rclpy.spin_once(self, timeout_sec=1.0)
         if self.is_docked is False:
             return True
 
+        #wait for up to 10 sec for the action server (ROS node) to become available
         if not self._undock_client.wait_for_server(timeout_sec=10.0):
             return False
 
+        #create a goal and wait for the action server to accept it
+        #goal_future is empty first and then has the answer whether the goal was accepted
         goal_future = self._undock_client.send_goal_async(Undock.Goal())
         rclpy.spin_until_future_complete(self,goal_future)
+        #the goal handle is the specific undocking request
         goal_handle = goal_future.result()
 
         if not goal_handle.accepted:
             rclpy.spin_once(self, timeout_sec=0.5)
             return self.is_docked is False
 
+        #get the result of the request and the status of the result
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
         result = result_future.result()
 
+        #if the status is successful return True
         if (result.status == GoalStatus.STATUS_SUCCEEDED):
             self.is_docked = False
             return True
@@ -261,25 +294,28 @@ class MissionNode(Node):
     def go_to_pose(self, pose_stamped):
         pose_stamped.header.stamp = self.get_clock().now().to_msg()
         self.get_logger().info(f"Navigating to x: {pose_stamped.pose.position.x}, y: {pose_stamped.pose.position.y}")
-        # TODO: Implement navigation to the given pose using Nav2's NavigateToPose action.
-        #       Return True once the robot has arrived, False if it did not. Callers
-        #       read the return value as "did this work", so falling off the end and
-        #       returning None counts as failure.
 
+        #create a navigation goal and give it the destination pose
         goal = NavigateToPose.Goal()
         goal.pose = pose_stamped
 
+        #send the goal and wait for the action server to accept it
+        #goal_future is empty first and then has the answer whether the goal was accepted
         goal_future = self._nav_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, goal_future)
+        #the goal handle is the specific navigation request
         goal_handle = goal_future.result()
 
+        #return False if the navigation goal was rejected
         if not goal_handle.accepted:
             return False
 
+        #get the result of the request and the status of the result
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
         result = result_future.result()
 
+        #if the status is successful return True
         if (result.status == GoalStatus.STATUS_SUCCEEDED):
             return True
         else:
@@ -330,6 +366,7 @@ class MissionNode(Node):
         if not result_future.done():
             self.get_logger().error('Arm trajectory did not finish in time!')
             return False
+        # Added
         result = result_future.result()
         return result is not None and result.status == GoalStatus.STATUS_SUCCEEDED
 
@@ -355,87 +392,106 @@ class MissionNode(Node):
         pick_pose = load_shelf(self.source_box)
         drop_pose = load_shelf(self.drop_box)
 
-        # TODO: Implement the mission logic (either State Machine or Behavior Tree).
+        # Added
+        self.arm_is_safe = False
+        self.localized = False
+        reached = set()
 
-        state = 'ARM_SAFE'
-        attempts = 0
-        max_attempts = 10
+        def action(name, function):
+            behaviour = MissionAction(name, function, self.get_logger())
+            return py_trees.decorators.Retry(
+                name=f'Retry {name}', child=behaviour, num_failures=10)
 
-        while state not in ('DONE', 'FAILED'):
-            self.get_logger().info(f'{state} state running')
+        def condition(name, check, correction_name, correction):
+            return py_trees.composites.Selector(
+                name=name,
+                memory=False,
+                children=[
+                    MissionCondition(f'{name}?', check),
+                    action(correction_name, correction),
+                ])
 
-            if state == 'ARM_SAFE':
-                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
-                next_state = 'UNDOCK'
+        def move_arm(angles, safe):
+            self.arm_is_safe = False
+            success = self.move_arm_to_joint_angles(angles)
+            if success:
+                self.arm_is_safe = safe
+            return success
 
-            elif state == 'UNDOCK':
-                done = self.undock_robot()
-                next_state = 'LOCALIZE' if self.grade == 'a' else 'GO_TO_PICK'
+        def run_localization():
+            self.localized = self.localize()
+            return self.localized
 
-            elif state == 'LOCALIZE':
-                done = self.localize_globally()
-                next_state = 'GO_TO_PICK'
-            
-            elif state == 'GO_TO_PICK':
-                done = self.go_to_pose(pick_pose)
-                next_state = 'ARM_TO_PICK'
-
-            elif state == 'ARM_TO_PICK':
-                done = self.move_arm_to_joint_angles(PICK_JOINTS)
-                next_state = 'PICK'
-
-            elif state == 'PICK':
-                self.toggle_vacuum(True)
-                done = True
-                next_state = 'ARM_SAFE_AFTER_PICK'
-
-            elif state == 'ARM_SAFE_AFTER_PICK':
-                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
-                next_state = 'GO_TO_DROP'
-
-            elif state == 'GO_TO_DROP':
-                done = self.go_to_pose(drop_pose)
-                next_state = 'ARM_TO_PLACE'
-
-            elif state == 'ARM_TO_PLACE':
-                done = self.move_arm_to_joint_angles(PLACE_JOINTS)
-                next_state = 'DROP'
-            
-            elif state == 'DROP':
-                self.toggle_vacuum(False)
-                done = True
-                next_state = 'ARM_SAFE_AFTER_DROP'
-
-            elif state == 'ARM_SAFE_AFTER_DROP':
-                done = self.move_arm_to_joint_angles(SAFE_JOINTS)
-                next_state = 'GO_TO_BASE'
-                
-            elif state == 'GO_TO_BASE':
-                done = self.go_to_pose(home_base)
-                next_state = 'DONE'
-
-            else:
-                state = 'FAILED'
-                continue
-
-            if done:
-                state = next_state
-                attempts = 0
-
-            else:
-                attempts += 1
-
-                if attempts >= max_attempts:
-                    state = 'FAILED'
-                
-                else:
-                    time.sleep(0.5)
-        
-        if state == 'DONE':
+        def vacuum(enable):
+            self.toggle_vacuum(enable)
             return True
-        
-        else:
-            return False
+
+        def backward_move(name, pose):
+            def navigate():
+                success = self.go_to_pose(pose)
+                if success:
+                    reached.add(name)
+                return success
+
+            preconditions = [
+                condition(
+                    'Arm In Safe Pos',
+                    lambda: self.arm_is_safe,
+                    'Move Arm to Safe Pos',
+                    lambda: move_arm(SAFE_JOINTS, True)),
+                condition(
+                    'Undocked',
+                    lambda: self.is_docked is False,
+                    'Undock',
+                    self.undock_robot),
+            ]
+            preconditions.append(condition(
+                'Localized',
+                lambda: self.localized,
+                'Global Localization',
+                run_localization))
+            preconditions.append(action(f'Move to {name}', navigate))
+
+            return py_trees.composites.Selector(
+                name=f'{name} Reached',
+                memory=False,
+                children=[
+                    MissionCondition(
+                        f'At {name}?', lambda: name in reached),
+                    py_trees.composites.Sequence(
+                        name='Move', memory=True, children=preconditions),
+                ])
+
+        mission = py_trees.composites.Sequence(
+            name='Warehouse Mission',
+            memory=True,
+            children=[
+                backward_move('Source', pick_pose),
+                action(
+                    'Arm to Pick',
+                    lambda: move_arm(PICK_JOINTS, False)),
+                action('Pick Cube', lambda: vacuum(True)),
+                backward_move('Target', drop_pose),
+                action(
+                    'Arm to Place',
+                    lambda: move_arm(PLACE_JOINTS, False)),
+                action('Place Cube', lambda: vacuum(False)),
+                backward_move('Home', home_base),
+            ])
+
+        tree = py_trees.trees.BehaviourTree(mission)
+        self.get_logger().info(
+            'Backward-chained behaviour tree:\n' +
+            py_trees.display.unicode_tree(mission))
+
+        while mission.status not in (
+                py_trees.common.Status.SUCCESS,
+                py_trees.common.Status.FAILURE):
+            tree.tick()
+            if mission.status == py_trees.common.Status.RUNNING:
+                time.sleep(0.1)
+
+        return mission.status == py_trees.common.Status.SUCCESS
 
 def main(args=None):
     rclpy.init(args=args)
