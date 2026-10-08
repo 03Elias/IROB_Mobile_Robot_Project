@@ -2,10 +2,12 @@ amcl:
   ros__parameters:
     use_sim_time: true
 
+    #TF coordinate frames for estimating robot pose
     global_frame_id: "map"
     odom_frame_id: "odom"
     base_frame_id: "base_link"
 
+    #topics amcl subscribe to for information
     scan_topic: "scan"
     map_topic: "map"
 
@@ -22,20 +24,24 @@ amcl:
     #mostly relevant to omnidirectional motion (not used in our case)
     alpha5: 0.2
 
+    #number of particles used in the filter
     min_particles: 500
     max_particles: 10000
 
+    #particle filter parameters
     pf_err: 0.05
     pf_z: 0.99
     resample_interval: 1
 
+    #thresholds for triggering particle filter updates
     update_min_d: 0.20
     update_min_a: 0.20
 
+    #laser model parameters
     laser_model_type: "likelihood_field"
     max_beams: 60
-    laser_min_range: -1.0
-    laser_max_range: -1.0
+    laser_min_range: -1.0 #using the min lidar range
+    laser_max_range: -1.0 #using the max lidar range
     laser_likelihood_max_dist: 2.0
 
     z_hit: 0.5
@@ -53,6 +59,7 @@ amcl:
     recovery_alpha_slow: 0.0
     recovery_alpha_fast: 0.0
 
+    #for kidnapping we do not know the intial pose
     set_initial_pose: false
     always_reset_initial_pose: false
     first_map_only: false

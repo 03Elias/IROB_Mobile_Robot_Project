@@ -15,20 +15,20 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     pkg_share = get_package_share_directory('warehouse_inventory_robot')
 
-    # amcl parameters file location.
+    # amcl parameters file location
     amcl_params = os.path.join(
         pkg_share,
         'config',
         'amcl.yaml'
 )
 
-    # map file location.
+    # map file location
     map_yaml = os.path.join(
         pkg_share,
         'maps',
         'warehouse.yaml'
 )
-
+    # nav2 parameters file location
     nav2_params = os.path.join(
         pkg_share,
         'config',
@@ -135,6 +135,7 @@ def generate_launch_description():
 
     # TODO: Navigation Layer
 
+    # starts the node responsible for calculating path
     navigation_launch = IncludeLaunchDescription(
     PythonLaunchDescriptionSource(
         os.path.join(
@@ -154,6 +155,8 @@ def generate_launch_description():
     # TODO: AMCL. For A grade only. The other grades get map -> odom from the static publisher
     # above, which is exact. Remember to launch amcl only for A grade.
 
+
+    # starts the localization node
     amcl_node = Node(
     package='nav2_amcl',
     executable='amcl',
@@ -171,6 +174,7 @@ def generate_launch_description():
 
     # TODO: Map server.
 
+    # starts the node that loads and publishes the warehouse map
     map_server = Node(
     package='nav2_map_server',
     executable='map_server',
@@ -198,6 +202,7 @@ def generate_launch_description():
     #     ros2 lifecycle get /map_server
     #     ros2 lifecycle set /map_server activate
 
+    # configures and activates the map server so it can publish the warehouse map
     map_lifecycle_manager = Node(
     package='nav2_lifecycle_manager',
     executable='lifecycle_manager',
@@ -209,7 +214,7 @@ def generate_launch_description():
         'node_names': ['map_server'],
     }],
 )
-
+    # configures and activates amcl for localization
     localization_lifecycle_manager = Node(
     package='nav2_lifecycle_manager',
     executable='lifecycle_manager',
