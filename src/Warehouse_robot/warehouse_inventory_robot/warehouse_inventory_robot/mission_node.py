@@ -63,38 +63,10 @@ DROP_BOX_BY_GRADE = {
     'a': 'shelf_7_ID20',   # target-2, same as C
 }
 
-# Added
+#agles for joins
 SAFE_JOINTS = [0.0, 0.87, 1.57, 0.0, -1.57, 0.0]
 PICK_JOINTS = [0.0, 1.50, 1.68, 0.0, 0.26, 0.0]
 PLACE_JOINTS = [0.0, 1.50, 2.13, 0.0, 0.53, 0.0]
-
-# Added
-class MissionCondition(py_trees.behaviour.Behaviour):
-
-    def __init__(self, name, condition):
-        super().__init__(name)
-        self.condition = condition
-
-    def update(self):
-        if self.condition():
-            return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
-
-
-# Added
-class MissionAction(py_trees.behaviour.Behaviour):
-
-    def __init__(self, name, action, logger):
-        super().__init__(name)
-        self.action = action
-        self.ros_logger = logger
-
-    def update(self):
-        self.ros_logger.info(f'{self.name} behaviour running')
-        if self.action():
-            return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
-
 
 def load_shelf(name: str) -> PoseStamped:
     for shelf in load_shelves():
@@ -388,29 +360,50 @@ class MissionNode(Node):
         # of this file rather than by their position in shelves.yaml. Indexing
         # into the list instead would tie the mission to the order of that file
         # and quietly send the robot to the wrong box when it changed.
-        home_base = load_home_base()
+        dock_base = load_home_base()
         pick_pose = load_shelf(self.source_box)
         drop_pose = load_shelf(self.drop_box)
 
-        # Added
         self.arm_is_safe = False
         self.localized = False
+        #stores the destination that have been reachesd
         reached = set()
 
-        def action(name, function):
-            behaviour = MissionAction(name, function, self.get_logger())
-            return py_trees.decorators.Retry(
-                name=f'Retry {name}', child=behaviour, num_failures=10)
+        #create bt leaf from a function
+        def leaf(name, function, log=False):
+            def update(behaviour):
+                #log which leaf is running
+                if log:
+                    self.get_logger().info(f'{name} running')
+                #run the function and make the bt status true or false
+                if function():
+                    return py_trees.common.Status.SUCCESS
+                return py_trees.common.Status.FAILURE
 
-        def condition(name, check, correction_name, correction):
+            #make a behaviour from function
+            behaviour = py_trees.meta.create_behaviour_from_function(update)
+            return behaviour(name)
+
+        #create an action leaf
+        def action_node(name, function):
+            return py_trees.decorators.Retry(
+                name=f'Retry {name}',
+                child=leaf(name, function, log=True),
+                num_failures=10)
+
+        #create a codition
+        def condition(name, check, action_name, action):
             return py_trees.composites.Selector(
                 name=name,
+                #makes the selector check the condition every time it is ticked
                 memory=False,
+                #creates two children, checks condition, if it is false performs the action
                 children=[
-                    MissionCondition(f'{name}?', check),
-                    action(correction_name, correction),
+                    leaf(f'{name}?', check),
+                    action_node(action_name, action),
                 ])
 
+        #move arm to safe pose
         def move_arm(angles, safe):
             self.arm_is_safe = False
             success = self.move_arm_to_joint_angles(angles)
@@ -418,80 +411,112 @@ class MissionNode(Node):
                 self.arm_is_safe = safe
             return success
 
+        #localize
         def run_localization():
             self.localized = self.localize()
             return self.localized
 
+        #engage vacuum
         def vacuum(enable):
             self.toggle_vacuum(enable)
             return True
 
-        def backward_move(name, pose):
+        def arm_is_safe():
+            return self.arm_is_safe
+
+        def move_arm_safe():
+            return move_arm(SAFE_JOINTS, True)
+
+        def is_undocked():
+            return self.is_docked is False
+
+        def is_localized():
+            return self.localized
+
+        def move_arm_to_pick():
+            return move_arm(PICK_JOINTS, False)
+
+        def pick():
+            return vacuum(True)
+
+        def move_arm_to_drop():
+            return move_arm(PLACE_JOINTS, False)
+
+        def drop():
+            return vacuum(False)
+
+        #subtree for moving to pick, drop and dock
+        def move(name, pose):
+
+            #navigate to pose
             def navigate():
                 success = self.go_to_pose(pose)
                 if success:
                     reached.add(name)
                 return success
 
-            preconditions = [
+            def destination_reached():
+                return name in reached
+
+            #firstly calls for example arm_is_safe, if is not then move_arm_safe
+            move_children = [
                 condition(
                     'Arm In Safe Pos',
-                    lambda: self.arm_is_safe,
+                    arm_is_safe,
                     'Move Arm to Safe Pos',
-                    lambda: move_arm(SAFE_JOINTS, True)),
+                    move_arm_safe),
                 condition(
                     'Undocked',
-                    lambda: self.is_docked is False,
+                    is_undocked,
                     'Undock',
                     self.undock_robot),
+                condition(
+                    'Localized',
+                    is_localized,
+                    'Localization',
+                    run_localization),
+                #creates an action leaf that is executed only if conditions are true
+                action_node(f'Move to {name}', navigate),
             ]
-            preconditions.append(condition(
-                'Localized',
-                lambda: self.localized,
-                'Global Localization',
-                run_localization))
-            preconditions.append(action(f'Move to {name}', navigate))
 
+            #return a subtree for moving to pick, drop, dock
             return py_trees.composites.Selector(
                 name=f'{name} Reached',
                 memory=False,
+                #first child check if destination has been reached, the second one runs the move sequence
                 children=[
-                    MissionCondition(
-                        f'At {name}?', lambda: name in reached),
+                    leaf(f'At {name}?', destination_reached),
                     py_trees.composites.Sequence(
-                        name='Move', memory=True, children=preconditions),
+                        name='Move', memory=True, children=move_children),
                 ])
 
+        #create the root node
         mission = py_trees.composites.Sequence(
-            name='Warehouse Mission',
+            name='Mission',
             memory=True,
             children=[
-                backward_move('Source', pick_pose),
-                action(
-                    'Arm to Pick',
-                    lambda: move_arm(PICK_JOINTS, False)),
-                action('Pick Cube', lambda: vacuum(True)),
-                backward_move('Target', drop_pose),
-                action(
-                    'Arm to Place',
-                    lambda: move_arm(PLACE_JOINTS, False)),
-                action('Place Cube', lambda: vacuum(False)),
-                backward_move('Home', home_base),
+                move('Pick', pick_pose),
+                action_node('Arm to Pick', move_arm_to_pick),
+                action_node('Pick', pick),
+                move('Drop', drop_pose),
+                action_node('Arm to Drop', move_arm_to_drop),
+                action_node('Drop', drop),
+                move('Dock', dock_base),
             ])
 
+        #create a bt
         tree = py_trees.trees.BehaviourTree(mission)
-        self.get_logger().info(
-            'Backward-chained behaviour tree:\n' +
-            py_trees.display.unicode_tree(mission))
-
-        while mission.status not in (
-                py_trees.common.Status.SUCCESS,
-                py_trees.common.Status.FAILURE):
+        #run until the mission either succeeds or fails
+        while mission.status not in (py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE):
+            #starts at the root and travels down
             tree.tick()
             if mission.status == py_trees.common.Status.RUNNING:
                 time.sleep(0.1)
 
-        return mission.status == py_trees.common.Status.SUCCESS
+        if mission.status == py_trees.common.Status.SUCCESS:
+            return True
+        else:
+            return False
 
 def main(args=None):
     rclpy.init(args=args)
